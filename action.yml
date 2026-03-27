@@ -1,0 +1,112 @@
+# Convention Deploy Action — preview environments, staging deploy, cleanup
+#
+# SSH encapsulation: scripts travel with the action (piped via SSH).
+# Convention-driven: derives project-path, compose files, infra detection.
+#
+# Per-project config (only two things):
+#   - DEPLOY_SSH_HOST: per-repo secret (server IP)
+#   - domain-suffix: workflow constant (e.g., wilsch-deployment.com)
+#
+# Part of CCI #646 deployment convention
+
+name: 'Convention Deploy'
+description: 'Deploy preview environments, staging, or cleanup via SSH'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  action:
+    description: 'deploy-preview | cleanup-preview | deploy-staging'
+    required: true
+  branch:
+    description: 'Branch name (required for deploy-preview and cleanup-preview)'
+    required: false
+    default: ''
+  domain-suffix:
+    description: 'Domain suffix for preview URLs (e.g., wilsch-deployment.com)'
+    required: true
+  ssh-host:
+    description: 'SSH host IP or hostname'
+    required: true
+  ssh-key:
+    description: 'SSH private key for deploy user'
+    required: true
+
+outputs:
+  preview-url:
+    description: 'Preview URL (deploy-preview only)'
+    value: ${{ steps.run.outputs.preview-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [[ "${{ inputs.action }}" =~ ^(deploy-preview|cleanup-preview)$ ]]; then
+          if [[ -z "${{ inputs.branch }}" ]]; then
+            echo "::error::branch input is required for ${{ inputs.action }}"
+            exit 1
+          fi
+        fi
+        if [[ ! "${{ inputs.action }}" =~ ^(deploy-preview|cleanup-preview|deploy-staging)$ ]]; then
+          echo "::error::Unknown action: ${{ inputs.action }}"
+          exit 1
+        fi
+
+    - name: Setup SSH
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh-key }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H ${{ inputs.ssh-host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+    - name: Derive conventions
+      id: conv
+      shell: bash
+      run: |
+        REPO_NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
+        echo "project-path=/home/deploy/projects/${REPO_NAME}" >> "$GITHUB_OUTPUT"
+
+    - name: Run action
+      id: run
+      shell: bash
+      run: |
+        SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${{ inputs.ssh-host }}"
+        SCRIPTS="${{ github.action_path }}/scripts"
+        PP="${{ steps.conv.outputs.project-path }}"
+
+        case "${{ inputs.action }}" in
+          deploy-preview)
+            # Level 0 pre-flight
+            $SSH "bash -s -- $PP" < "${SCRIPTS}/preflight.sh"
+
+            # Deploy preview
+            $SSH "bash -s -- $PP ${{ inputs.branch }} ${{ inputs.domain-suffix }}" \
+              < "${SCRIPTS}/deploy-preview.sh" 2>&1 | tee /tmp/deploy-output.txt
+
+            PREVIEW_URL=$(grep -oP 'https://[a-z0-9-]+\.\S+' /tmp/deploy-output.txt | tail -1)
+            echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+            ;;
+
+          cleanup-preview)
+            $SSH "bash -s -- $PP ${{ inputs.branch }} ${{ inputs.domain-suffix }}" \
+              < "${SCRIPTS}/cleanup-preview.sh"
+            ;;
+
+          deploy-staging)
+            # Level 0 pre-flight
+            $SSH "bash -s -- $PP" < "${SCRIPTS}/preflight.sh"
+
+            # Deploy staging
+            $SSH "bash -s -- $PP ${{ inputs.domain-suffix }}" \
+              < "${SCRIPTS}/deploy-staging.sh"
+            ;;
+        esac
+
+    - name: Cleanup SSH
+      if: always()
+      shell: bash
+      run: rm -f ~/.ssh/deploy_key
