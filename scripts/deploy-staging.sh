@@ -21,13 +21,14 @@ INFRA_COMPOSE_FILE="docker-compose.infra.yml"
 echo "=== Deploying to staging ==="
 echo "Project: $PROJECT_PATH"
 
-# --- Git: pull latest ---
+# --- Git: ensure on staging and pull latest ---
 echo ""
 echo "=== Pulling latest code ==="
 git fetch origin
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-git pull origin "$CURRENT_BRANCH"
-echo "Branch: $CURRENT_BRANCH (updated)"
+# Always deploy from staging — preview deploys may have switched the branch
+git checkout staging 2>/dev/null || git checkout -b staging origin/staging
+git pull origin staging
+echo "Branch: staging (updated)"
 
 # --- Two-phase detection ---
 if [[ -f "$INFRA_COMPOSE_FILE" ]]; then
