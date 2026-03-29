@@ -1,0 +1,279 @@
+# Convention Deploy — reusable workflow for push=preview deployment.
+#
+# Replaces the composite action (action.yml) with a single reusable workflow
+# that absorbs all deployment boilerplate: routing, validation, SSH transport,
+# git auth via GitHub App token, and deploy-linker issue comments.
+#
+# Design: CCI #646 (deployment-runtime-state-design), Parts 4 + 6 + 7.
+# Decision: Reusable workflow chosen over composite action because project
+# workflows were duplicating identical job structures, deploy-linker logic,
+# and issue extraction. This absorbs all of it — projects provide only
+# domain-suffix and ssh-host.
+#
+# Token flow: Org secrets (APP_ID, APP_PRIVATE_KEY) → actions/create-github-app-token
+# → ephemeral 1hr token → injected as env var into SSH commands → deploy scripts
+# use HTTPS + token for git pull. No permanent git credentials on any server.
+# Falls back to existing SSH git if APP_ID not set (incremental rollout).
+#
+# Per-project workflow (~12 lines):
+#   name: Deploy
+#   on:
+#     push:
+#       branches: ['issue-*', 'staging']
+#     pull_request:
+#       types: [closed]
+#       branches: [staging]
+#   jobs:
+#     deploy:
+#       uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@2026-03-29
+#       with:
+#         domain-suffix: wilsch-deployment.com
+#         ssh-host: 91.99.74.207
+#       secrets: inherit
+
+name: Convention Deploy
+
+on:
+  workflow_call:
+    inputs:
+      domain-suffix:
+        description: 'Domain suffix for preview URLs (e.g., wilsch-deployment.com)'
+        required: true
+        type: string
+      ssh-host:
+        description: 'SSH host IP for deployment server'
+        required: true
+        type: string
+
+# Secrets inherited from caller via `secrets: inherit`.
+# Org-level: DEPLOY_SSH_KEY, APP_ID, APP_PRIVATE_KEY, ISSUE_LINKER_TOKEN
+
+jobs:
+  # ─── Route: detect action from caller's trigger context ───
+  route:
+    name: Route
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.detect.outputs.action }}
+      branch: ${{ steps.detect.outputs.branch }}
+      issue-number: ${{ steps.detect.outputs.issue-number }}
+    steps:
+      - name: Detect action from trigger
+        id: detect
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+            ACTION="cleanup-preview"
+          elif [[ "${{ github.ref_name }}" == "staging" ]]; then
+            BRANCH="staging"
+            ACTION="deploy-staging"
+          else
+            BRANCH="${{ github.ref_name }}"
+            ACTION="deploy-preview"
+          fi
+
+          ISSUE_NUM=$(echo "$BRANCH" | grep -oP '(?<=issue-)\d+' || true)
+
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "issue-number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "Action: $ACTION | Branch: $BRANCH | Issue: ${ISSUE_NUM:-none}"
+
+  # ─── Validate: Level 0 convention checks (skip for cleanup) ───
+  validate:
+    name: Level 0 — Convention Validator
+    needs: route
+    if: needs.route.outputs.action != 'cleanup-preview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose convention
+        run: |
+          set -euo pipefail
+          COMPOSE_FILE="docker-compose.yml"
+          ERRORS=()
+
+          if [[ ! -f "$COMPOSE_FILE" ]]; then
+            echo "::error::Compose file not found: $COMPOSE_FILE"
+            exit 1
+          fi
+
+          echo "=== Level 0: Validating compose convention ==="
+
+          # No container_name (breaks COMPOSE_PROJECT_NAME isolation)
+          if grep -qP '^\s+container_name:' "$COMPOSE_FILE"; then
+            ERRORS+=("container_name: found — breaks isolation")
+          fi
+
+          # No external: true networks (breaks self-contained stacks)
+          if grep -qP '^\s+external:\s*true' "$COMPOSE_FILE"; then
+            ERRORS+=("external: true found — stacks must be self-contained")
+          fi
+
+          # Healthcheck on every service
+          SERVICES=$(yq '.services | keys | .[]' "$COMPOSE_FILE" 2>/dev/null) || {
+            echo "::error::Invalid YAML in $COMPOSE_FILE"
+            exit 1
+          }
+          for svc in $SERVICES; do
+            if [[ "$(yq ".services.$svc.healthcheck" "$COMPOSE_FILE")" == "null" ]]; then
+              ERRORS+=("service '$svc': missing healthcheck")
+            fi
+          done
+
+          # .env.example or .env must exist
+          if [[ ! -f ".env.example" ]] && [[ ! -f ".env" ]]; then
+            ERRORS+=(".env.example missing")
+          fi
+
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
+            for err in "${ERRORS[@]}"; do echo "::error::$err"; done
+            echo "${#ERRORS[@]} convention violation(s)."
+            exit 1
+          fi
+
+          echo "Convention checks passed."
+
+  # ─── Deploy: token generation, SSH transport, deploy-linker ───
+  deploy:
+    name: ${{ needs.route.outputs.action }}
+    needs: [route, validate]
+    if: |
+      always() &&
+      needs.route.result == 'success' &&
+      (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check App credentials
+        id: check-app
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+        run: |
+          if [[ -n "$APP_ID" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::APP_ID not set — falling back to SSH git auth"
+          fi
+
+      - name: Generate App token
+        id: app-token
+        if: steps.check-app.outputs.available == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout deploy scripts
+        uses: actions/checkout@v4
+        with:
+          repository: WILSCH-AI-SERVICES/deploy-action
+          path: _deploy
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.ssh-host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run
+        id: run
+        env:
+          ACTION: ${{ needs.route.outputs.action }}
+          BRANCH: ${{ needs.route.outputs.branch }}
+          DOMAIN_SUFFIX: ${{ inputs.domain-suffix }}
+          SSH_HOST: ${{ inputs.ssh-host }}
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+          GIT_REPO: ${{ github.repository }}
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${SSH_HOST}"
+          S="_deploy/scripts"
+          PP="/home/deploy/projects/$(echo "$GIT_REPO" | cut -d/ -f2)"
+
+          run_remote() {
+            local script="$1"; shift
+            $SSH "GIT_TOKEN=${GIT_TOKEN:-} GIT_REPO=${GIT_REPO:-} bash -s -- $*" < "$script"
+          }
+
+          case "$ACTION" in
+            deploy-preview)
+              run_remote "${S}/preflight.sh" "$PP"
+              run_remote "${S}/deploy-preview.sh" "$PP" "$BRANCH" "$DOMAIN_SUFFIX" \
+                2>&1 | tee /tmp/deploy.log
+              PREVIEW_URL=$(grep -oP 'https://[a-z0-9-]+\.\S+' /tmp/deploy.log | tail -1)
+              echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+              ;;
+            cleanup-preview)
+              $SSH "bash -s -- $PP $BRANCH $DOMAIN_SUFFIX" < "${S}/cleanup-preview.sh"
+              ;;
+            deploy-staging)
+              run_remote "${S}/preflight.sh" "$PP"
+              run_remote "${S}/deploy-staging.sh" "$PP" "$DOMAIN_SUFFIX"
+              ;;
+          esac
+
+      - name: Deploy-linker — success
+        if: success() && needs.route.outputs.issue-number != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ISSUE_LINKER_TOKEN }}
+          ACTION: ${{ needs.route.outputs.action }}
+          ISSUE: ${{ needs.route.outputs.issue-number }}
+          BRANCH: ${{ needs.route.outputs.branch }}
+          PREVIEW_URL: ${{ steps.run.outputs.preview-url }}
+          DOMAIN_SUFFIX: ${{ inputs.domain-suffix }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
+
+          case "$ACTION" in
+            deploy-preview)
+              URL="${PREVIEW_URL:-https://${BRANCH}.${DOMAIN_SUFFIX}}"
+              BODY="📦 **Preview deployed:** ${URL}
+
+          Branch: \`${BRANCH}\`
+          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+
+          🤖"
+              ;;
+            cleanup-preview)
+              BODY="🧹 **Preview cleaned up** for branch \`${BRANCH}\`
+
+          🤖"
+              ;;
+            deploy-staging)
+              BODY="🚀 **Staging deployed**
+
+          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+
+          🤖"
+              ;;
+          esac
+
+          gh issue comment "$ISSUE" \
+            --repo DaveX2001/deliverable-tracking \
+            --body "$BODY"
+
+      - name: Deploy-linker — failure
+        if: failure() && needs.route.outputs.issue-number != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ISSUE_LINKER_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
+          gh issue comment "${{ needs.route.outputs.issue-number }}" \
+            --repo DaveX2001/deliverable-tracking \
+            --body "❌ **Deploy failed** (${{ needs.route.outputs.action }})
+
+          Branch: \`${{ needs.route.outputs.branch }}\`
+          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          🤖"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

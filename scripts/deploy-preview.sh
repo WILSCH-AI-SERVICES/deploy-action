@@ -20,6 +20,11 @@ DOMAIN_SUFFIX="${3:?Missing domain-suffix}"
 
 cd "$PROJECT_PATH"
 
+# --- Git auth: HTTPS + ephemeral token (falls back to SSH remote if unset) ---
+if [[ -n "${GIT_TOKEN:-}" && -n "${GIT_REPO:-}" ]]; then
+    git remote set-url origin "https://x-access-token:${GIT_TOKEN}@github.com/${GIT_REPO}.git"
+fi
+
 # --- Configuration ---
 CADDY_CONF_DIR="/etc/caddy/conf.d"
 COMPOSE_FILE="docker-compose.yml"

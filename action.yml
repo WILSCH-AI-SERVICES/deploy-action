@@ -1,11 +1,11 @@
-# Convention Deploy Action — preview environments, staging deploy, cleanup
+# DEPRECATED — Use the reusable workflow instead:
+#   uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@2026-03-29
 #
-# SSH encapsulation: scripts travel with the action (piped via SSH).
-# Convention-driven: derives project-path, compose files, infra detection.
+# This composite action is kept for backwards compatibility during migration.
+# It will be removed once all projects use the reusable workflow.
 #
-# Per-project config (only two things):
-#   - DEPLOY_SSH_HOST: per-repo secret (server IP)
-#   - domain-suffix: workflow constant (e.g., wilsch-deployment.com)
+# The reusable workflow absorbs: deploy-linker, convention validator,
+# issue extraction, and GitHub App token auth. See .github/workflows/deploy.yml.
 #
 # Part of CCI #646 deployment convention
 
