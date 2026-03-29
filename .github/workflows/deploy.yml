@@ -46,7 +46,8 @@ on:
         type: string
 
 # Secrets inherited from caller via `secrets: inherit`.
-# Org-level: DEPLOY_SSH_KEY, APP_ID, APP_PRIVATE_KEY, ISSUE_LINKER_TOKEN
+# Org-level: DEPLOY_SSH_KEY, APP_ID, APP_PRIVATE_KEY
+# Deploy-linker uses App token (owner: DaveX2001) — no separate ISSUE_LINKER_TOKEN needed
 
 jobs:
   # ─── Route: detect action from caller's trigger context ───
@@ -159,13 +160,23 @@ jobs:
             echo "::warning::APP_ID not set — falling back to SSH git auth"
           fi
 
-      - name: Generate App token
+      - name: Generate App token (git pull)
         id: app-token
         if: steps.check-app.outputs.available == 'true'
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Generate App token (deploy-linker)
+        id: linker-token
+        if: steps.check-app.outputs.available == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: DaveX2001
 
       - name: Checkout deploy scripts
         uses: actions/checkout@v4
@@ -220,7 +231,7 @@ jobs:
         if: success() && needs.route.outputs.issue-number != ''
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.ISSUE_LINKER_TOKEN }}
+          GH_TOKEN: ${{ steps.linker-token.outputs.token }}
           ACTION: ${{ needs.route.outputs.action }}
           ISSUE: ${{ needs.route.outputs.issue-number }}
           BRANCH: ${{ needs.route.outputs.branch }}
@@ -261,7 +272,7 @@ jobs:
         if: failure() && needs.route.outputs.issue-number != ''
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.ISSUE_LINKER_TOKEN }}
+          GH_TOKEN: ${{ steps.linker-token.outputs.token }}
         run: |
           if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
           gh issue comment "${{ needs.route.outputs.issue-number }}" \
