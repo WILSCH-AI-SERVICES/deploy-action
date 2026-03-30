@@ -35,7 +35,7 @@
 #       branches: [staging]
 #   jobs:
 #     deploy:
-#       uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@v2
+#       uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@2026-03-30-09-31
 #       with:
 #         domain-suffix: wilsch-deployment.com
 #         ssh-host: 91.99.74.207
