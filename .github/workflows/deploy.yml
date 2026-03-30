@@ -15,6 +15,16 @@
 # use HTTPS + token for git pull. No permanent git credentials on any server.
 # Falls back to existing SSH git if APP_ID not set (incremental rollout).
 #
+# Back-pressure levels (all fatal):
+#   L0 (convention) — validator job, exit 10 — compose convention checks
+#   L1 (preflight)  — preflight.sh,  exit 11 — server readiness checks
+#   L2 (config)     — deploy script,  exit 12 — compose config validation
+#   L3 (health)     — deploy script,  exit 13 — service health checks
+#   L4 (access)     — deploy script,  exit 14 — external access verification
+#
+# Error transport: scripts echo DEPLOY_ERROR:LEVEL=N:DETAIL=... before exit.
+# Deploy-linker parses this from /tmp/deploy.log for level-specific comments.
+#
 # Per-project workflow (~12 lines):
 #   name: Deploy
 #   on:
@@ -25,7 +35,7 @@
 #       branches: [staging]
 #   jobs:
 #     deploy:
-#       uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@2026-03-29
+#       uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@v2
 #       with:
 #         domain-suffix: wilsch-deployment.com
 #         ssh-host: 91.99.74.207
@@ -87,13 +97,17 @@ jobs:
     if: needs.route.outputs.action != 'cleanup-preview'
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    outputs:
+      errors: ${{ steps.validate.outputs.errors }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate compose convention
+      - name: Validate compose conventions
+        id: validate
         run: |
           set -euo pipefail
           COMPOSE_FILE="docker-compose.yml"
+          INFRA_COMPOSE="docker-compose.infra.yml"
           ERRORS=()
 
           if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -101,36 +115,112 @@ jobs:
             exit 1
           fi
 
-          echo "=== Level 0: Validating compose convention ==="
+          echo "=== Level 0: Validating compose conventions ==="
+
+          TWO_PHASE=false
+          if [[ -f "$INFRA_COMPOSE" ]]; then
+            TWO_PHASE=true
+            echo "Two-phase project detected: $INFRA_COMPOSE exists"
+          fi
+
+          # ── Shared checks: healthcheck, version pinning, volume name ban ──
+          validate_shared() {
+            local file="$1"
+            local prefix="$2"  # "" for app, "infra " for infra
+
+            local services
+            services=$(yq '.services | keys | .[]' "$file" 2>/dev/null || true)
+            [[ -z "$services" ]] && return
+
+            # Healthcheck on every service
+            for svc in $services; do
+              [[ "$(yq ".services.$svc.healthcheck" "$file")" != "null" ]] && continue
+              ERRORS+=("${prefix}service '$svc': missing healthcheck")
+            done
+
+            # Version pinning on stateful services (named volumes = stateful)
+            local named_vols
+            named_vols=$(yq '.volumes | keys | .[]' "$file" 2>/dev/null || true)
+            [[ -z "$named_vols" ]] && return
+
+            for svc in $services; do
+              local svc_vols
+              svc_vols=$(yq ".services.$svc.volumes[]" "$file" 2>/dev/null || true)
+              [[ -z "$svc_vols" ]] && continue
+
+              # Check if service uses any named volume
+              local is_stateful=false
+              while IFS= read -r nvol; do
+                [[ -z "$nvol" ]] && continue
+                echo "$svc_vols" | grep -q "^${nvol}:" && is_stateful=true && break
+              done <<< "$named_vols"
+              [[ "$is_stateful" != "true" ]] && continue
+
+              local image
+              image=$(yq ".services.$svc.image" "$file" 2>/dev/null || true)
+              [[ -z "$image" || "$image" == "null" ]] && continue
+
+              local tag="${image##*:}"
+              [[ "$image" == "$tag" ]] && tag=""
+              if [[ -z "$tag" || "$tag" =~ ^(latest|main|dev|nightly)$ ]]; then
+                ERRORS+=("${prefix}service '$svc': image tag not pinned on stateful service — pin major version")
+              elif ! [[ "$tag" =~ [0-9] ]]; then
+                ERRORS+=("${prefix}service '$svc': image tag '$tag' not pinned — pin major version")
+              fi
+            done
+
+            # No hardcoded volume name: (breaks COMPOSE_PROJECT_NAME isolation)
+            local hardcoded
+            hardcoded=$(yq '.volumes | to_entries | .[] | select(.value != null and .value.name != null) | .key' "$file" 2>/dev/null || true)
+            [[ -z "$hardcoded" ]] && return
+            while IFS= read -r vol; do
+              [[ -z "$vol" ]] && continue
+              ERRORS+=("${prefix}volume '$vol': hardcoded name: breaks isolation")
+            done <<< "$hardcoded"
+          }
+
+          # ── App compose checks (docker-compose.yml) ──
 
           # No container_name (breaks COMPOSE_PROJECT_NAME isolation)
           if grep -qP '^\s+container_name:' "$COMPOSE_FILE"; then
-            ERRORS+=("container_name: found — breaks isolation")
+            ERRORS+=("container_name: found in $COMPOSE_FILE — breaks isolation")
           fi
 
-          # No external: true networks (breaks self-contained stacks)
-          if grep -qP '^\s+external:\s*true' "$COMPOSE_FILE"; then
-            ERRORS+=("external: true found — stacks must be self-contained")
-          fi
-
-          # Healthcheck on every service
-          SERVICES=$(yq '.services | keys | .[]' "$COMPOSE_FILE" 2>/dev/null) || {
-            echo "::error::Invalid YAML in $COMPOSE_FILE"
-            exit 1
-          }
-          for svc in $SERVICES; do
-            if [[ "$(yq ".services.$svc.healthcheck" "$COMPOSE_FILE")" == "null" ]]; then
-              ERRORS+=("service '$svc': missing healthcheck")
+          # External network validation (infra-aware)
+          EXTERNAL_NETS=$(yq '.networks | to_entries | .[] | select(.value.external == true) | .key' "$COMPOSE_FILE" 2>/dev/null || true)
+          if [[ -n "$EXTERNAL_NETS" ]]; then
+            if [[ "$TWO_PHASE" == "true" ]]; then
+              INFRA_NETS=$(yq '.networks | keys | .[]' "$INFRA_COMPOSE" 2>/dev/null || true)
+              while IFS= read -r net; do
+                [[ -z "$net" ]] && continue
+                if ! echo "$INFRA_NETS" | grep -qx "$net"; then
+                  ERRORS+=("network '$net': external: true not from infra compose — stacks must be self-contained")
+                fi
+              done <<< "$EXTERNAL_NETS"
+            else
+              ERRORS+=("external: true found — stacks must be self-contained")
             fi
-          done
+          fi
 
           # .env.example or .env must exist
           if [[ ! -f ".env.example" ]] && [[ ! -f ".env" ]]; then
             ERRORS+=(".env.example missing")
           fi
 
+          # Shared checks for app compose
+          validate_shared "$COMPOSE_FILE" ""
+
+          # ── Infra compose checks (docker-compose.infra.yml) ──
+          if [[ "$TWO_PHASE" == "true" ]]; then
+            echo "Validating infra compose..."
+            validate_shared "$INFRA_COMPOSE" "infra "
+            # Note: container_name is ALLOWED in infra compose
+          fi
+
           if [[ ${#ERRORS[@]} -gt 0 ]]; then
             for err in "${ERRORS[@]}"; do echo "::error::$err"; done
+            ERR_STR=$(printf '%s; ' "${ERRORS[@]}")
+            echo "errors=${ERR_STR}" >> "$GITHUB_OUTPUT"
             echo "${#ERRORS[@]} convention violation(s)."
             exit 1
           fi
@@ -212,9 +302,9 @@ jobs:
 
           case "$ACTION" in
             deploy-preview)
-              run_remote "${S}/preflight.sh" "$PP"
+              run_remote "${S}/preflight.sh" "$PP" 2>&1 | tee /tmp/deploy.log
               run_remote "${S}/deploy-preview.sh" "$PP" "$BRANCH" "$DOMAIN_SUFFIX" \
-                2>&1 | tee /tmp/deploy.log
+                2>&1 | tee -a /tmp/deploy.log
               PREVIEW_URL=$(grep -oP 'https://[a-z0-9-]+\.\S+' /tmp/deploy.log | tail -1)
               echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
               ;;
@@ -222,10 +312,25 @@ jobs:
               $SSH "bash -s -- $PP $BRANCH $DOMAIN_SUFFIX" < "${S}/cleanup-preview.sh"
               ;;
             deploy-staging)
-              run_remote "${S}/preflight.sh" "$PP"
-              run_remote "${S}/deploy-staging.sh" "$PP" "$DOMAIN_SUFFIX"
+              run_remote "${S}/preflight.sh" "$PP" 2>&1 | tee /tmp/deploy.log
+              run_remote "${S}/deploy-staging.sh" "$PP" "$DOMAIN_SUFFIX" \
+                2>&1 | tee -a /tmp/deploy.log
               ;;
           esac
+
+      - name: Parse deploy error
+        id: parse-error
+        if: failure()
+        run: |
+          if [[ -f /tmp/deploy.log ]]; then
+            DEPLOY_ERR=$(grep 'DEPLOY_ERROR:' /tmp/deploy.log | tail -1 || true)
+            if [[ -n "$DEPLOY_ERR" ]]; then
+              LEVEL=$(echo "$DEPLOY_ERR" | sed 's/.*LEVEL=\([0-9]*\).*/\1/')
+              DETAIL=$(echo "$DEPLOY_ERR" | sed 's/.*DETAIL=//')
+              echo "level=$LEVEL" >> "$GITHUB_OUTPUT"
+              echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Deploy-linker — success
         if: success() && needs.route.outputs.issue-number != ''
@@ -273,11 +378,89 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.linker-token.outputs.token }}
+          LEVEL: ${{ steps.parse-error.outputs.level }}
+          DETAIL: ${{ steps.parse-error.outputs.detail }}
         run: |
           if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
+
+          case "${LEVEL:-}" in
+            1) LEVEL_NAME="server pre-flight" ;;
+            2) LEVEL_NAME="compose config" ;;
+            3) LEVEL_NAME="health checks" ;;
+            4) LEVEL_NAME="external access" ;;
+            *) LEVEL_NAME="unknown"; LEVEL="?" ;;
+          esac
+
+          if [[ -n "${DETAIL:-}" ]]; then
+            BODY="❌ **Deploy failed at Level ${LEVEL} (${LEVEL_NAME})**
+
+          > ${DETAIL}
+
+          Branch: \`${{ needs.route.outputs.branch }}\`
+          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          🤖"
+          else
+            BODY="❌ **Deploy failed at Level ${LEVEL} (${LEVEL_NAME})**
+
+          Branch: \`${{ needs.route.outputs.branch }}\`
+          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          🤖"
+          fi
+
           gh issue comment "${{ needs.route.outputs.issue-number }}" \
             --repo DaveX2001/deliverable-tracking \
-            --body "❌ **Deploy failed** (${{ needs.route.outputs.action }})
+            --body "$BODY"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  # ─── Deploy-linker: Level 0 failure (validator rejected) ───
+  linker-l0:
+    name: Deploy Linker — L0
+    needs: [route, validate]
+    if: |
+      always() &&
+      needs.validate.result == 'failure' &&
+      needs.route.outputs.issue-number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check App credentials
+        id: check-app
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+        run: |
+          if [[ -n "$APP_ID" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate App token
+        id: linker-token
+        if: steps.check-app.outputs.available == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: DaveX2001
+
+      - name: Post L0 failure comment
+        env:
+          GH_TOKEN: ${{ steps.linker-token.outputs.token }}
+          ERRORS: ${{ needs.validate.outputs.errors }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
+
+          BODY="❌ **Deploy failed at Level 0 (convention)**
+
+          > ${ERRORS}
 
           Branch: \`${{ needs.route.outputs.branch }}\`
           Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
@@ -285,6 +468,6 @@ jobs:
 
           🤖"
 
-      - name: Cleanup SSH
-        if: always()
-        run: rm -f ~/.ssh/deploy_key
+          gh issue comment "${{ needs.route.outputs.issue-number }}" \
+            --repo DaveX2001/deliverable-tracking \
+            --body "$BODY"

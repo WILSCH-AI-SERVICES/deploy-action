@@ -9,7 +9,9 @@
 #   - Two-phase auto-detected: docker-compose.infra.yml exists → infra shared, app isolated
 #   - Ports auto-assigned (all _PORT env vars zeroed for isolation)
 #   - Volumes cloned from staging (skipped in update mode)
-#   - 4-level back pressure: config → health → curl → logs
+#   - 5-level back pressure: L0 convention → L1 preflight → L2 config → L3 health → L4 access
+#   - Structured exit codes: 12=L2, 13=L3, 14=L4 (L0/L1 handled by validator/preflight.sh)
+#   - DEPLOY_ERROR transport: script echoes DEPLOY_ERROR:LEVEL=N:DETAIL=... before exit
 
 set -euo pipefail
 
@@ -39,17 +41,28 @@ git fetch origin
 git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
 git pull origin "$BRANCH"
 
+# =================================================================
+# Level 2: Validate compose config
+# =================================================================
+echo ""
+echo "=== Level 2: Validating compose config ==="
+if ! COMPOSE_ERR=$(docker compose config --quiet 2>&1); then
+    echo "DEPLOY_ERROR:LEVEL=2:DETAIL=compose config invalid: ${COMPOSE_ERR}" >&2
+    exit 12
+fi
+echo "Compose config valid."
+
 # --- Detect staging project name ---
-STAGING_PROJECT=$(docker compose config --format json 2>/dev/null | jq -r '.name')
+STAGING_PROJECT=$(docker compose config --format json | jq -r '.name')
 if [[ -z "$STAGING_PROJECT" || "$STAGING_PROJECT" == "null" ]]; then
-    echo "ERROR: Cannot detect staging project name from $COMPOSE_FILE" >&2
-    exit 1
+    echo "DEPLOY_ERROR:LEVEL=2:DETAIL=cannot detect staging project name from $COMPOSE_FILE" >&2
+    exit 12
 fi
 
 # Guard: preview must not collide with staging
 if [[ "$PROJECT_NAME" == "$STAGING_PROJECT" ]]; then
-    echo "ERROR: Branch name resolves to staging project name '$STAGING_PROJECT'" >&2
-    exit 1
+    echo "DEPLOY_ERROR:LEVEL=2:DETAIL=branch resolves to staging project name '$STAGING_PROJECT'" >&2
+    exit 12
 fi
 
 # --- Detect update vs fresh deploy ---
@@ -70,9 +83,8 @@ ENTRY_INFO=$(docker compose config --format json | jq -r '
   "\(.key) \(.value.labels["deploy.entry"])"
 ')
 if [[ -z "$ENTRY_INFO" ]]; then
-    echo "ERROR: No service with deploy.entry label found in $COMPOSE_FILE" >&2
-    echo "  Fix: Add 'labels: { deploy.entry: \"<container-port>\" }' to the entry service" >&2
-    exit 1
+    echo "DEPLOY_ERROR:LEVEL=2:DETAIL=no service with deploy.entry label in $COMPOSE_FILE" >&2
+    exit 12
 fi
 ENTRY_SERVICE=$(echo "$ENTRY_INFO" | head -1 | awk '{print $1}')
 ENTRY_PORT=$(echo "$ENTRY_INFO" | head -1 | awk '{print $2}')
@@ -125,14 +137,6 @@ cleanup_on_failure() {
 trap cleanup_on_failure EXIT
 
 # =================================================================
-# Level 1: Validate compose config
-# =================================================================
-echo ""
-echo "=== Level 1: Validating compose config ==="
-COMPOSE_PROJECT_NAME="$PROJECT_NAME" docker compose "${COMPOSE_ARGS[@]}" config --quiet
-echo "Compose config valid."
-
-# =================================================================
 # Clone volumes (skip in update mode)
 # =================================================================
 CLEANUP_NEEDED=true
@@ -160,12 +164,15 @@ else
 fi
 
 # =================================================================
-# Level 2: Start services + wait for health
+# Level 3: Start services + wait for health
 # =================================================================
 echo ""
-echo "=== Level 2: Starting services (waiting for health) ==="
-COMPOSE_PROJECT_NAME="$PROJECT_NAME" \
-    docker compose "${COMPOSE_ARGS[@]}" up -d --wait --pull always
+echo "=== Level 3: Starting services (waiting for health) ==="
+if ! COMPOSE_PROJECT_NAME="$PROJECT_NAME" \
+    docker compose "${COMPOSE_ARGS[@]}" up -d --wait --pull always; then
+    echo "DEPLOY_ERROR:LEVEL=3:DETAIL=service health check failed" >&2
+    exit 13
+fi
 
 echo "All services healthy."
 
@@ -192,36 +199,22 @@ sudo caddy reload --config /etc/caddy/Caddyfile
 echo "Caddy configured for ${PREVIEW_DOMAIN}"
 
 # =================================================================
-# Level 3: Verify external access
+# Level 4: Verify external access (fatal with retries)
 # =================================================================
 echo ""
-echo "=== Level 3: Verifying external access ==="
+echo "=== Level 4: Verifying external access ==="
 for i in 1 2 3; do
     if curl -sf --max-time 10 "https://${PREVIEW_DOMAIN}" >/dev/null 2>&1; then
         echo "Preview accessible at https://${PREVIEW_DOMAIN}"
         break
     fi
     if [[ $i -eq 3 ]]; then
-        echo "WARNING: Preview not yet accessible at https://${PREVIEW_DOMAIN}"
-        echo "  May need DNS propagation or TLS provisioning."
-    else
-        echo "  Attempt $i/3 — waiting for TLS/DNS..."
-        sleep 5
+        echo "DEPLOY_ERROR:LEVEL=4:DETAIL=preview not accessible at https://${PREVIEW_DOMAIN} after 3 retries" >&2
+        exit 14
     fi
+    echo "  Attempt $i/3 — waiting for TLS/DNS..."
+    sleep 5
 done
-
-# =================================================================
-# Level 4: Check service logs
-# =================================================================
-echo ""
-echo "=== Level 4: Checking service logs ==="
-ERROR_COUNT=$(COMPOSE_PROJECT_NAME="$PROJECT_NAME" docker compose "${COMPOSE_ARGS[@]}" logs --tail=50 2>&1 | grep -ci "error\|fatal\|panic" || true)
-if [[ "$ERROR_COUNT" -gt 0 ]]; then
-    echo "WARNING: Found $ERROR_COUNT error-like entries in recent logs"
-    echo "  Review: COMPOSE_PROJECT_NAME=$PROJECT_NAME docker compose logs"
-else
-    echo "No errors in recent logs."
-fi
 
 # =================================================================
 # Success — disarm cleanup trap

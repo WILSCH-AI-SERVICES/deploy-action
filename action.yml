@@ -1,5 +1,5 @@
 # DEPRECATED — Use the reusable workflow instead:
-#   uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@2026-03-29
+#   uses: WILSCH-AI-SERVICES/deploy-action/.github/workflows/deploy.yml@v2
 #
 # This composite action is kept for backwards compatibility during migration.
 # It will be removed once all projects use the reusable workflow.
