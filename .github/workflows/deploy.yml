@@ -291,6 +291,7 @@ jobs:
           GIT_TOKEN: ${{ steps.app-token.outputs.token }}
           GIT_REPO: ${{ github.repository }}
         run: |
+          set -o pipefail
           SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${SSH_HOST}"
           S="_deploy/scripts"
           PP="/home/deploy/projects/$(echo "$GIT_REPO" | cut -d/ -f2)"
