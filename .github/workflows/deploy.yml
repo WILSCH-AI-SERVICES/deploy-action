@@ -74,7 +74,12 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BRANCH="${{ github.event.pull_request.head.ref }}"
-            ACTION="cleanup-preview"
+            if [[ "$BRANCH" == issue-* ]]; then
+              ACTION="cleanup-preview"
+            else
+              echo "Action: skip | Branch: $BRANCH (no preview to clean up)"
+              exit 0
+            fi
           elif [[ "${{ github.ref_name }}" == "staging" ]]; then
             BRANCH="staging"
             ACTION="deploy-staging"
