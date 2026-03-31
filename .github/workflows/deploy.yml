@@ -310,7 +310,8 @@ jobs:
               echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
               ;;
             cleanup-preview)
-              $SSH "bash -s -- $PP $BRANCH $DOMAIN_SUFFIX" < "${S}/cleanup-preview.sh"
+              $SSH "bash -s -- $PP $BRANCH $DOMAIN_SUFFIX" < "${S}/cleanup-preview.sh" \
+                2>&1 | tee /tmp/deploy.log
               ;;
             deploy-staging)
               run_remote "${S}/preflight.sh" "$PP" 2>&1 | tee /tmp/deploy.log
@@ -322,15 +323,30 @@ jobs:
       - name: Parse deploy error
         id: parse-error
         if: failure()
+        env:
+          ACTION: ${{ needs.route.outputs.action }}
         run: |
-          if [[ -f /tmp/deploy.log ]]; then
-            DEPLOY_ERR=$(grep 'DEPLOY_ERROR:' /tmp/deploy.log | tail -1 || true)
-            if [[ -n "$DEPLOY_ERR" ]]; then
-              LEVEL=$(echo "$DEPLOY_ERR" | sed 's/.*LEVEL=\([0-9]*\).*/\1/')
-              DETAIL=$(echo "$DEPLOY_ERR" | sed 's/.*DETAIL=//')
-              echo "level=$LEVEL" >> "$GITHUB_OUTPUT"
-              echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
-            fi
+          if [[ ! -f /tmp/deploy.log ]]; then
+            echo "detail=SSH connection failed or script not found" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Cleanup errors use CLEANUP_ERROR transport
+          CLEANUP_ERR=$(grep 'CLEANUP_ERROR:' /tmp/deploy.log | tail -1 || true)
+          if [[ -n "$CLEANUP_ERR" ]]; then
+            DETAIL=$(echo "$CLEANUP_ERR" | sed 's/.*DETAIL=//')
+            echo "cleanup=true" >> "$GITHUB_OUTPUT"
+            echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Deploy errors use DEPLOY_ERROR transport
+          DEPLOY_ERR=$(grep 'DEPLOY_ERROR:' /tmp/deploy.log | tail -1 || true)
+          if [[ -n "$DEPLOY_ERR" ]]; then
+            LEVEL=$(echo "$DEPLOY_ERR" | sed 's/.*LEVEL=\([0-9]*\).*/\1/')
+            DETAIL=$(echo "$DEPLOY_ERR" | sed 's/.*DETAIL=//')
+            echo "level=$LEVEL" >> "$GITHUB_OUTPUT"
+            echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Deploy-linker — success
@@ -362,7 +378,7 @@ jobs:
           🤖"
               ;;
             deploy-staging)
-              BODY="🚀 **Staging deployed**
+              BODY="🚀 **Staging deployed:** https://${DOMAIN_SUFFIX}
 
           Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
 
@@ -379,37 +395,62 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.linker-token.outputs.token }}
+          ACTION: ${{ needs.route.outputs.action }}
           LEVEL: ${{ steps.parse-error.outputs.level }}
           DETAIL: ${{ steps.parse-error.outputs.detail }}
+          CLEANUP: ${{ steps.parse-error.outputs.cleanup }}
         run: |
           if [[ -z "$GH_TOKEN" ]]; then exit 0; fi
 
-          case "${LEVEL:-}" in
-            1) LEVEL_NAME="server pre-flight" ;;
-            2) LEVEL_NAME="compose config" ;;
-            3) LEVEL_NAME="health checks" ;;
-            4) LEVEL_NAME="external access" ;;
-            *) LEVEL_NAME="unknown"; LEVEL="?" ;;
-          esac
+          BRANCH="${{ needs.route.outputs.branch }}"
+          COMMIT="[\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})"
+          LOGS="[View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
-          if [[ -n "${DETAIL:-}" ]]; then
-            BODY="❌ **Deploy failed at Level ${LEVEL} (${LEVEL_NAME})**
+          if [[ "${CLEANUP:-}" == "true" ]]; then
+            # Cleanup uses distinct format
+            BODY="🧹 **Cleanup failed**
 
-          > ${DETAIL}
+          > ${DETAIL:-cleanup error}
 
-          Branch: \`${{ needs.route.outputs.branch }}\`
-          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          Branch: \`${BRANCH}\`
+          Commit: ${COMMIT}
+          ${LOGS}
 
           🤖"
           else
-            BODY="❌ **Deploy failed at Level ${LEVEL} (${LEVEL_NAME})**
+            case "${LEVEL:-}" in
+              1) LEVEL_NAME="server pre-flight" ;;
+              2) LEVEL_NAME="compose config" ;;
+              3) LEVEL_NAME="health checks" ;;
+              4) LEVEL_NAME="external access" ;;
+              *) LEVEL_NAME="unknown"; LEVEL="?" ;;
+            esac
 
-          Branch: \`${{ needs.route.outputs.branch }}\`
-          Commit: [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            if [[ "$ACTION" == "deploy-staging" ]]; then
+              PREFIX="Staging deploy failed"
+            else
+              PREFIX="Deploy failed"
+            fi
+
+            if [[ -n "${DETAIL:-}" ]]; then
+              BODY="❌ **${PREFIX} at Level ${LEVEL} (${LEVEL_NAME})**
+
+          > ${DETAIL}
+
+          Branch: \`${BRANCH}\`
+          Commit: ${COMMIT}
+          ${LOGS}
 
           🤖"
+            else
+              BODY="❌ **${PREFIX} at Level ${LEVEL} (${LEVEL_NAME})**
+
+          Branch: \`${BRANCH}\`
+          Commit: ${COMMIT}
+          ${LOGS}
+
+          🤖"
+            fi
           fi
 
           gh issue comment "${{ needs.route.outputs.issue-number }}" \

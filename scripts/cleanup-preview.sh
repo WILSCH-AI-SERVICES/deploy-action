@@ -14,6 +14,10 @@ PROJECT_PATH="${1:?Usage: cleanup-preview.sh <project-path> <branch> <domain-suf
 BRANCH="${2:?Missing branch}"
 DOMAIN_SUFFIX="${3:?Missing domain-suffix}"
 
+# --- Error transport: emit CLEANUP_ERROR before exit on failure ---
+CURRENT_DETAIL="cleanup failed"
+trap 'echo "CLEANUP_ERROR:DETAIL=${CURRENT_DETAIL}" >&2; exit 1' ERR
+
 cd "$PROJECT_PATH"
 
 # --- Configuration ---
@@ -44,6 +48,7 @@ fi
 # =================================================================
 # Stop containers and remove branch-scoped volumes
 # =================================================================
+CURRENT_DETAIL="docker compose down failed for ${PROJECT_NAME}"
 echo ""
 echo "=== Stopping services ==="
 if COMPOSE_PROJECT_NAME="$PROJECT_NAME" docker compose "${COMPOSE_ARGS[@]}" ps --quiet 2>/dev/null | grep -q .; then
@@ -61,6 +66,7 @@ fi
 # =================================================================
 # Remove Caddy config and reload
 # =================================================================
+CURRENT_DETAIL="caddy config removal failed for ${PROJECT_NAME}"
 echo ""
 echo "=== Removing Caddy config ==="
 CONF_FILE="${CADDY_CONF_DIR}/${PROJECT_NAME}.conf"

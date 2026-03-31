@@ -13,6 +13,11 @@ set -euo pipefail
 PROJECT_PATH="${1:?Usage: deploy-staging.sh <project-path> <domain-suffix>}"
 DOMAIN_SUFFIX="${2:?Missing domain-suffix}"
 
+# --- Error transport: emit DEPLOY_ERROR before exit on failure ---
+CURRENT_LEVEL=2
+CURRENT_DETAIL="staging deploy failed"
+trap 'echo "DEPLOY_ERROR:LEVEL=${CURRENT_LEVEL}:DETAIL=${CURRENT_DETAIL}" >&2; exit $((CURRENT_LEVEL + 10))' ERR
+
 cd "$PROJECT_PATH"
 
 # --- Git auth: HTTPS + ephemeral token (falls back to SSH remote if unset) ---
@@ -27,6 +32,7 @@ echo "=== Deploying to staging ==="
 echo "Project: $PROJECT_PATH"
 
 # --- Git: ensure on staging and pull latest ---
+CURRENT_LEVEL=2; CURRENT_DETAIL="git pull failed"
 echo ""
 echo "=== Pulling latest code ==="
 git fetch origin
@@ -37,12 +43,14 @@ echo "Branch: staging (updated)"
 
 # --- Two-phase detection ---
 if [[ -f "$INFRA_COMPOSE_FILE" ]]; then
+    CURRENT_LEVEL=3; CURRENT_DETAIL="infra service health check failed"
     echo ""
     echo "=== Phase 1: Updating infra services ==="
     docker compose -f "$INFRA_COMPOSE_FILE" up -d --wait --pull always
     echo "Infra services healthy."
 fi
 
+CURRENT_LEVEL=3; CURRENT_DETAIL="app service health check failed"
 echo ""
 echo "=== Phase 2: Updating app services ==="
 docker compose up -d --wait --pull always
