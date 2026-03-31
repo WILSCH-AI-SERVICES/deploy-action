@@ -77,8 +77,7 @@ jobs:
             if [[ "$BRANCH" == issue-* ]]; then
               ACTION="cleanup-preview"
             else
-              echo "Action: skip | Branch: $BRANCH (no preview to clean up)"
-              exit 0
+              ACTION="skip"
             fi
           elif [[ "${{ github.ref_name }}" == "staging" ]]; then
             BRANCH="staging"
@@ -175,13 +174,16 @@ jobs:
             done
 
             # No hardcoded volume name: (breaks COMPOSE_PROJECT_NAME isolation)
-            local hardcoded
-            hardcoded=$(yq '.volumes | to_entries | .[] | select(.value != null and .value.name != null) | .key' "$file" 2>/dev/null || true)
-            [[ -z "$hardcoded" ]] && return
-            while IFS= read -r vol; do
-              [[ -z "$vol" ]] && continue
-              ERRORS+=("${prefix}volume '$vol': hardcoded name: breaks isolation")
-            done <<< "$hardcoded"
+            # Infra volumes use stable (hardcoded) names by design — singletons, shared across projects
+            if [[ -z "$prefix" ]]; then
+              local hardcoded
+              hardcoded=$(yq '.volumes | to_entries | .[] | select(.value != null and .value.name != null) | .key' "$file" 2>/dev/null || true)
+              [[ -z "$hardcoded" ]] && return
+              while IFS= read -r vol; do
+                [[ -z "$vol" ]] && continue
+                ERRORS+=("volume '$vol': hardcoded name: breaks isolation")
+              done <<< "$hardcoded"
+            fi
           }
 
           # ── App compose checks (docker-compose.yml) ──
