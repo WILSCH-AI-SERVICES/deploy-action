@@ -169,7 +169,7 @@ fi
 echo ""
 echo "=== Level 3: Starting services (waiting for health) ==="
 if ! COMPOSE_PROJECT_NAME="$PROJECT_NAME" \
-    docker compose "${COMPOSE_ARGS[@]}" up -d --wait --pull always; then
+    docker compose "${COMPOSE_ARGS[@]}" up -d --wait --build --pull always; then
     echo "DEPLOY_ERROR:LEVEL=3:DETAIL=service health check failed" >&2
     exit 13
 fi
