@@ -53,7 +53,7 @@ fi
 CURRENT_LEVEL=3; CURRENT_DETAIL="app service health check failed"
 echo ""
 echo "=== Phase 2: Updating app services ==="
-docker compose up -d --wait --pull always
+docker compose up -d --wait --build --pull always
 echo "App services healthy."
 
 # --- Verify all services ---
