@@ -297,6 +297,7 @@ jobs:
           SSH_HOST: ${{ inputs.ssh-host }}
           GIT_TOKEN: ${{ steps.app-token.outputs.token }}
           GIT_REPO: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -o pipefail
           SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${SSH_HOST}"
@@ -305,7 +306,7 @@ jobs:
 
           run_remote() {
             local script="$1"; shift
-            $SSH "GIT_TOKEN=${GIT_TOKEN:-} GIT_REPO=${GIT_REPO:-} bash -s -- $*" < "$script"
+            $SSH "GIT_TOKEN=${GIT_TOKEN:-} GIT_REPO=${GIT_REPO:-} GITHUB_SHA=${GITHUB_SHA:-} bash -s -- $*" < "$script"
           }
 
           case "$ACTION" in

@@ -36,10 +36,33 @@ CURRENT_LEVEL=2; CURRENT_DETAIL="git pull failed"
 echo ""
 echo "=== Pulling latest code ==="
 git fetch origin
-# Always deploy from staging — preview deploys may have switched the branch
-git checkout staging 2>/dev/null || git checkout -b staging origin/staging
+# Always deploy from staging — preview deploys may have switched the branch.
+# No stderr swallow: a dirty or failed checkout must surface, not silently leave
+# HEAD on a preview branch (the #922 shared-checkout contamination).
+git checkout staging || git checkout -b staging origin/staging
 git pull origin staging
 echo "Branch: staging (updated)"
+
+# --- Source-isolation guard (#922) ---
+# PROJECT_PATH is keyed on repo, not branch, so preview and staging share one
+# on-disk checkout. A concurrent preview deploy can leave this dir on the wrong
+# branch — without this gate a stale checkout ships under a green GHA run. That
+# silent contamination is what invalidated the org-revert MCP validation in
+# #2076/#2087. Assert the triggering commit is actually reachable from HEAD on
+# staging; otherwise fail loudly instead of deploying stale code.
+if [[ -n "${GITHUB_SHA:-}" ]]; then
+    CURRENT_LEVEL=2
+    ON_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+    CURRENT_DETAIL="source-isolation (#922): on branch '${ON_BRANCH}', triggering commit ${GITHUB_SHA:0:7} not reachable from HEAD $(git rev-parse --short HEAD) — shared checkout served stale/wrong code"
+    # Spring the ERR trap (→ DEPLOY_ERROR:LEVEL=2, exit 12) unless we are on
+    # staging AND the triggering commit is an ancestor of HEAD. A bare `&&` would
+    # be exempt from set -e on its left operand, so the not-on-staging case is
+    # made explicit here.
+    if [[ "$ON_BRANCH" != "staging" ]] || ! git merge-base --is-ancestor "$GITHUB_SHA" HEAD; then
+        false
+    fi
+    echo "Source-isolation guard passed: HEAD on staging includes ${GITHUB_SHA:0:7}."
+fi
 
 # --- Two-phase detection ---
 if [[ -f "$INFRA_COMPOSE_FILE" ]]; then
