@@ -16,9 +16,15 @@
 set -euo pipefail
 
 # --- Arguments ---
-PROJECT_PATH="${1:?Usage: deploy-preview.sh <project-path> <branch> <domain-suffix>}"
+PROJECT_PATH="${1:?Usage: deploy-preview.sh <project-path> <branch> <domain-suffix> [staging-path]}"
 BRANCH="${2:?Missing branch}"
 DOMAIN_SUFFIX="${3:?Missing domain-suffix}"
+# #2266: the preview now runs in its own per-branch checkout ($PROJECT_PATH),
+# distinct from the repo-root (staging) checkout. The staging project name — used
+# to locate staging's volumes to clone and the shared infra network — must be read
+# where staging lives, not from this preview dir (compose derives the project name
+# from the directory basename). Defaults to PROJECT_PATH for backward-compat.
+STAGING_PATH="${4:-$PROJECT_PATH}"
 
 cd "$PROJECT_PATH"
 
@@ -52,8 +58,8 @@ if ! COMPOSE_ERR=$(docker compose config --quiet 2>&1); then
 fi
 echo "Compose config valid."
 
-# --- Detect staging project name ---
-STAGING_PROJECT=$(docker compose config --format json | jq -r '.name')
+# --- Detect staging project name (from the repo-root checkout, #2266) ---
+STAGING_PROJECT=$( cd "$STAGING_PATH" && docker compose config --format json | jq -r '.name' )
 if [[ -z "$STAGING_PROJECT" || "$STAGING_PROJECT" == "null" ]]; then
     echo "DEPLOY_ERROR:LEVEL=2:DETAIL=cannot detect staging project name from $COMPOSE_FILE" >&2
     exit 12

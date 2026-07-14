@@ -323,7 +323,7 @@ jobs:
               PREVIEW_PATH="${PP}-${SANITIZED}"
               run_remote "${S}/provision-preview-checkout.sh" "$PP" "$PREVIEW_PATH" 2>&1 | tee /tmp/deploy.log
               run_remote "${S}/preflight.sh" "$PREVIEW_PATH" 2>&1 | tee -a /tmp/deploy.log
-              run_remote "${S}/deploy-preview.sh" "$PREVIEW_PATH" "$BRANCH" "$DOMAIN_SUFFIX" \
+              run_remote "${S}/deploy-preview.sh" "$PREVIEW_PATH" "$BRANCH" "$DOMAIN_SUFFIX" "$PP" \
                 2>&1 | tee -a /tmp/deploy.log
               PREVIEW_URL=$(grep -oP 'https://[a-z0-9-]+\.\S+' /tmp/deploy.log | tail -1)
               echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
