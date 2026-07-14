@@ -278,7 +278,11 @@ jobs:
       - name: Checkout deploy scripts
         uses: actions/checkout@v4
         with:
-          repository: WILSCH-AI-SERVICES/deploy-action
+          # #2266 verification harness: pull the feature scripts (incl.
+          # provision-preview-checkout.sh) from this fork's feature ref. Production
+          # fleet rollout of the ref-pinning mechanism is deferred in-design.
+          repository: Riaan-Fourie/deploy-action
+          ref: issue-2266-per-preview-checkout
           path: _deploy
 
       - name: Setup SSH
@@ -311,8 +315,15 @@ jobs:
 
           case "$ACTION" in
             deploy-preview)
-              run_remote "${S}/preflight.sh" "$PP" 2>&1 | tee /tmp/deploy.log
-              run_remote "${S}/deploy-preview.sh" "$PP" "$BRANCH" "$DOMAIN_SUFFIX" \
+              # #2266: previews operate in a per-branch STANDALONE checkout, distinct
+              # from the repo-root (staging) path — so a preview never checks out a
+              # branch in the repo-root. Sanitization must match deploy-preview.sh /
+              # cleanup-preview.sh PROJECT_NAME so all three agree on the path.
+              SANITIZED=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+              PREVIEW_PATH="${PP}-${SANITIZED}"
+              run_remote "${S}/provision-preview-checkout.sh" "$PP" "$PREVIEW_PATH" 2>&1 | tee /tmp/deploy.log
+              run_remote "${S}/preflight.sh" "$PREVIEW_PATH" 2>&1 | tee -a /tmp/deploy.log
+              run_remote "${S}/deploy-preview.sh" "$PREVIEW_PATH" "$BRANCH" "$DOMAIN_SUFFIX" \
                 2>&1 | tee -a /tmp/deploy.log
               PREVIEW_URL=$(grep -oP 'https://[a-z0-9-]+\.\S+' /tmp/deploy.log | tail -1)
               echo "preview-url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
