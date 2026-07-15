@@ -18,8 +18,6 @@ DOMAIN_SUFFIX="${3:?Missing domain-suffix}"
 CURRENT_DETAIL="cleanup failed"
 trap 'echo "CLEANUP_ERROR:DETAIL=${CURRENT_DETAIL}" >&2; exit 1' ERR
 
-cd "$PROJECT_PATH"
-
 # --- Configuration ---
 CADDY_CONF_DIR="/etc/caddy/conf.d"
 COMPOSE_FILE="docker-compose.yml"
@@ -27,6 +25,17 @@ INFRA_COMPOSE_FILE="docker-compose.infra.yml"
 
 # Must match deploy-preview.sh sanitization
 PROJECT_NAME=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+
+# #2266: the preview ran from its own per-branch STANDALONE checkout, distinct
+# from the repo-root path. Derive it the same way deploy.yml provisioned it, tear
+# down from there, and remove it on teardown. Fall back to the repo-root path for
+# the `down` only if the per-branch checkout is already gone.
+PREVIEW_PATH="${PROJECT_PATH}-${PROJECT_NAME}"
+if [[ -d "$PREVIEW_PATH" ]]; then
+    cd "$PREVIEW_PATH"
+else
+    cd "$PROJECT_PATH"
+fi
 
 echo "Cleaning up preview: $PROJECT_NAME"
 
@@ -76,6 +85,22 @@ if [[ -f "$CONF_FILE" ]]; then
     echo "Caddy config removed and reloaded."
 else
     echo "No Caddy config found at $CONF_FILE (already clean)."
+fi
+
+# =================================================================
+# Remove the per-branch standalone checkout (#2266)
+# =================================================================
+CURRENT_DETAIL="preview checkout removal failed for ${PREVIEW_PATH}"
+echo ""
+echo "=== Removing preview checkout ==="
+# Leave the current (soon-to-be-deleted) dir before removing it; the staging
+# health check below must run from the repo-root checkout, not the preview copy.
+cd "$PROJECT_PATH"
+if [[ -d "$PREVIEW_PATH" && "$PREVIEW_PATH" != "$PROJECT_PATH" ]]; then
+    rm -rf "$PREVIEW_PATH"
+    echo "Removed preview checkout: $PREVIEW_PATH"
+else
+    echo "No preview checkout at $PREVIEW_PATH (already clean)."
 fi
 
 # =================================================================
