@@ -1,0 +1,74 @@
+name: Harness 2287
+# Temporary witness harness for DaveX2001/deliverable-tracking#2287.
+# Drives the scratch consumer (deploy-preview-scratch-2265b) via the org
+# deploy App token, because the ceremony runner has read-only on the consumer.
+# Removed when #2287 closes.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'staging-witness | preview-witness | ab-branches'
+        required: true
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App token (consumer write)
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: WILSCH-AI-SERVICES
+          repositories: deploy-preview-scratch-2265b
+
+      - name: Clone consumer
+        run: |
+          git clone https://x-access-token:${{ steps.token.outputs.token }}@github.com/WILSCH-AI-SERVICES/deploy-preview-scratch-2265b.git consumer
+          cd consumer
+          git config user.name "wilsch-deploy-harness"
+          git config user.email "harness-2287@wilsch-ai.com"
+
+      - name: Staging witness push
+        if: inputs.mode == 'staging-witness'
+        run: |
+          cd consumer
+          git checkout staging
+          echo 'AC-TOKEN=SCRATCH-2265B-STAGING-2287-F1-RESTORE' > html/index.html
+          git add html/index.html
+          git commit -m 'Witness F1 restore: staging deploy under org-sourced scripts (#2287)'
+          git push origin staging
+
+      - name: Preview witness push
+        if: inputs.mode == 'preview-witness'
+        run: |
+          cd consumer
+          git checkout -b issue-2287 origin/staging
+          echo 'AC-TOKEN=SCRATCH-2265B-PREVIEW-2287-F1-RESTORE' > html/index.html
+          git add html/index.html
+          git commit -m 'Witness F1 restore: preview deploy under org-sourced scripts (#2287)'
+          git push origin issue-2287
+
+      - name: A/B branches
+        if: inputs.mode == 'ab-branches'
+        run: |
+          cd consumer
+          S0=$(git rev-parse origin/staging)
+          # dirty candidate: edits the served file at S0
+          git checkout -b issue-2287-ab-dirty "$S0"
+          echo 'AC-TOKEN=SCRATCH-2265B-AB-DIRTY-2287' > html/index.html
+          git add html/index.html
+          git commit -m 'A/B dirty arm: served-file edit that will conflict with staging (#2287)'
+          git push origin issue-2287-ab-dirty
+          # clean candidate: adds a fresh file, stays mergeable
+          git checkout -b issue-2287-ab-clean "$S0"
+          echo 'AC-TOKEN=SCRATCH-2265B-AB-CLEAN-2287' > ab-clean-token.txt
+          git add ab-clean-token.txt
+          git commit -m 'A/B clean arm: additive change, stays mergeable (#2287)'
+          git push origin issue-2287-ab-clean
+          # advance staging on the same served-file lines to make the dirty arm conflict
+          git checkout staging && git pull origin staging
+          echo 'AC-TOKEN=SCRATCH-2265B-STAGING-2287-AB-BASE' > html/index.html
+          git add html/index.html
+          git commit -m 'A/B base advance: staging moves on the served file (#2287)'
+          git push origin staging
