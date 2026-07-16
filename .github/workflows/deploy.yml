@@ -278,11 +278,7 @@ jobs:
       - name: Checkout deploy scripts
         uses: actions/checkout@v4
         with:
-          # #2266 verification harness: pull the feature scripts (incl.
-          # provision-preview-checkout.sh) from this fork's feature ref. Production
-          # fleet rollout of the ref-pinning mechanism is deferred in-design.
-          repository: Riaan-Fourie/deploy-action
-          ref: issue-2266-per-preview-checkout
+          repository: WILSCH-AI-SERVICES/deploy-action
           path: _deploy
 
       - name: Setup SSH
