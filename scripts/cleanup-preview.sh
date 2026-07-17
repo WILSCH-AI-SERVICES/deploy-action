@@ -93,9 +93,18 @@ fi
 CURRENT_DETAIL="preview checkout removal failed for ${PREVIEW_PATH}"
 echo ""
 echo "=== Removing preview checkout ==="
-# Leave the current (soon-to-be-deleted) dir before removing it; the staging
-# health check below must run from the repo-root checkout, not the preview copy.
-cd "$PROJECT_PATH"
+# Leave the current (soon-to-be-deleted) dir before removing it. When the
+# staging-root checkout is PRESENT we return to it — the health check below runs
+# there. When it is ABSENT (the reconciliation-sweep orphan case, #1011: the
+# consumer's staging root was already torn down, so `cd "$PROJECT_PATH"` under
+# `set -e` would abort the whole cleanup), we step to the projects parent
+# instead so `rm -rf` and the run still succeed, and skip the staging check.
+if [[ -d "$PROJECT_PATH" ]]; then
+    cd "$PROJECT_PATH"
+else
+    cd "$(dirname "$PROJECT_PATH")"
+    echo "Note: staging root absent at $PROJECT_PATH (orphan cleanup) — staging health check will be skipped."
+fi
 if [[ -d "$PREVIEW_PATH" && "$PREVIEW_PATH" != "$PROJECT_PATH" ]]; then
     rm -rf "$PREVIEW_PATH"
     echo "Removed preview checkout: $PREVIEW_PATH"
@@ -104,18 +113,22 @@ else
 fi
 
 # =================================================================
-# Verify staging health
+# Verify staging health (only when a staging root exists to verify)
 # =================================================================
 echo ""
-echo "=== Verifying staging health ==="
-RUNNING_COUNT=$(docker compose ps --status running --quiet 2>/dev/null | wc -l | tr -d ' ')
-EXPECTED_COUNT=$(docker compose config --format json | jq '[.services | keys[]] | length')
+if [[ -d "$PROJECT_PATH" ]]; then
+    echo "=== Verifying staging health ==="
+    RUNNING_COUNT=$(docker compose ps --status running --quiet 2>/dev/null | wc -l | tr -d ' ')
+    EXPECTED_COUNT=$(docker compose config --format json | jq '[.services | keys[]] | length')
 
-if [[ "$RUNNING_COUNT" -eq "$EXPECTED_COUNT" ]]; then
-    echo "Staging: $RUNNING_COUNT/$EXPECTED_COUNT services running."
+    if [[ "$RUNNING_COUNT" -eq "$EXPECTED_COUNT" ]]; then
+        echo "Staging: $RUNNING_COUNT/$EXPECTED_COUNT services running."
+    else
+        echo "WARNING: Staging: $RUNNING_COUNT/$EXPECTED_COUNT services running." >&2
+        echo "  Verify manually: docker compose ps" >&2
+    fi
 else
-    echo "WARNING: Staging: $RUNNING_COUNT/$EXPECTED_COUNT services running." >&2
-    echo "  Verify manually: docker compose ps" >&2
+    echo "=== Skipping staging health check — no staging root at $PROJECT_PATH (orphan cleanup) ==="
 fi
 
 # =================================================================

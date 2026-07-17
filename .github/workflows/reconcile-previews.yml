@@ -1,0 +1,168 @@
+# Reconcile Previews — the teardown source of truth for preview environments.
+#
+# Design: Preview Lifecycle — When a Preview Dies (Parts 3–5)
+#   https://docs.wilsch-ai.com/global/preview-lifecycle-design
+# Issue: DaveX2001/claude-code-improvements#1011
+#
+# A preview lives exactly while its PR is open AND its branch was pushed within
+# the activity window (default 14 days, push-only heartbeat, operator-tunable).
+# This daily sweep is the SOURCE OF TRUTH; the per-repo `pull_request: closed`
+# trigger in deploy.yml stays as the best-effort fast path. This workflow lives
+# and fires in deploy-action itself — no consumer repository's workflow is
+# touched.
+#
+# Three reads, one diff (all over the same SSH transport deploys use):
+#   1. reconcile-enumerate.sh  (on box)     — census what the box is running
+#   2. reconcile-sweep.sh      (in runner)  — ask GitHub which previews are alive
+#   3. cleanup-preview.sh       (on box)     — tear down the difference
+#
+# Only ATTRIBUTABLE (checkout-backed) previews are ever removed. Branch-only
+# residue (Caddy routes / compose projects with no per-branch checkout) is
+# reported, never removed. Read failures fail SAFE — the preview is kept.
+#
+# The maiden run is the purge and its acceptance proof: dispatch it manually
+# (dry_run=true first to preview the dead set, then dry_run=false).
+
+name: Reconcile Previews
+
+on:
+  schedule:
+    # Daily at 04:17 UTC (low-traffic). Scheduled runs use input defaults
+    # (dry_run=false) and only fire from the default branch.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      window_days:
+        description: 'Activity window (days): a preview lives while its PR is open AND pushed within this many days'
+        type: string
+        default: '14'
+      dry_run:
+        description: 'Report only — compute the dead set but tear nothing down'
+        type: boolean
+        default: false
+      org:
+        description: 'GitHub org that owns the consumer repos'
+        type: string
+        default: 'WILSCH-AI-SERVICES'
+
+# Never let two sweeps race on the box.
+concurrency:
+  group: reconcile-previews
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile previews
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SSH_HOST: '91.99.74.207'
+      DOMAIN_SUFFIX: 'wilsch-deployment.com'
+      PROJECTS_DIR: '/home/deploy/projects'
+      CADDY_CONF_DIR: '/etc/caddy/conf.d'
+      COMMENT_REPO: 'DaveX2001/deliverable-tracking'
+      WINDOW_DAYS: ${{ inputs.window_days || '14' }}
+      ORG: ${{ inputs.org || 'WILSCH-AI-SERVICES' }}
+    steps:
+      # ── Pass 0 gate: org secrets must reach deploy-action's OWN runs ──
+      - name: Check App credentials (Pass 0)
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+        run: |
+          if [[ -z "$APP_ID" ]]; then
+            echo "::error::APP_ID not available to deploy-action's own run — org secrets are not reaching this workflow. Pass 0 fails; fix org-secret visibility before reconciling."
+            exit 1
+          fi
+          echo "Org secrets present (Pass 0 satisfied for this run)."
+
+      # ── Token for reading PR/branch state across the consumer org ──
+      - name: Generate read token (org PR/branch reads)
+        id: read-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ inputs.org || 'WILSCH-AI-SERVICES' }}
+
+      # ── Token for posting 🧹 comments to deliverable-tracking issues ──
+      - name: Generate comment token (deliverable-tracking)
+        id: comment-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: DaveX2001
+
+      - name: Checkout deploy-action scripts
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # ── Read 1: census the box (read-only) ──
+      - name: Enumerate box state
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${SSH_HOST}"
+          $SSH "bash -s -- '$PROJECTS_DIR' '$CADDY_CONF_DIR' '$DOMAIN_SUFFIX'" \
+            < scripts/reconcile-enumerate.sh > inventory.json
+          echo "Census:"; jq '{checkouts:(.checkouts|length), residue:(.residue|length)}' inventory.json
+
+      # ── Read 2 + diff: decide the dead set from GitHub truth, write report ──
+      - name: Decide dead set (alive-rule)
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: |
+          REPORT_FILE="$GITHUB_STEP_SUMMARY" \
+            bash scripts/reconcile-sweep.sh inventory.json > decision.json
+          echo "Decision:"; jq '{dead:(.dead|length), alive:(.alive|length), indeterminate:(.indeterminate|length), residue:(.residue|length)}' decision.json
+          echo "Dead branches:"; jq -r '.dead[].branch' decision.json || true
+
+      # ── Teardown: cleanup-preview.sh per dead preview + 🧹 comment ──
+      #    Skipped entirely on dry-run.
+      - name: Teardown dead previews
+        if: ${{ (inputs.dry_run || false) == false }}
+        env:
+          GH_TOKEN: ${{ steps.comment-token.outputs.token }}
+        run: |
+          set -o pipefail
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy@${SSH_HOST}"
+          COUNT=$(jq '.dead | length' decision.json)
+          echo "Tearing down ${COUNT} dead preview(s)..."
+          FAILED=0
+          # Process substitution (not a pipe) so FAILED survives the loop.
+          while IFS= read -r d; do
+            [[ -n "$d" ]] || continue
+            branch=$(jq -r '.branch' <<<"$d")
+            pp=$(jq -r '.project_path' <<<"$d")
+            issue=$(jq -r '.issue_number' <<<"$d")
+            echo "::group::cleanup ${branch} (project_path=${pp})"
+            if $SSH "bash -s -- '$pp' '$branch' '$DOMAIN_SUFFIX'" < scripts/cleanup-preview.sh; then
+              echo "Torn down: ${branch}"
+              if [[ -n "$issue" && -n "${GH_TOKEN:-}" ]]; then
+                gh issue comment "$issue" --repo "$COMMENT_REPO" --body "$(printf '🧹 **Preview cleaned up** for branch `%s` by the daily reconciliation sweep (no open PR, or outside the activity window).\n\n🤖' "$branch")" \
+                  || echo "::warning::could not post 🧹 comment to ${COMMENT_REPO}#${issue}"
+              else
+                echo "::warning::no issue number or comment token — skipped 🧹 comment for ${branch}"
+              fi
+            else
+              echo "::error::cleanup failed for ${branch}"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done < <(jq -c '.dead[]' decision.json)
+          if [[ "$FAILED" == "1" ]]; then
+            echo "::error::one or more teardowns failed"; exit 1
+          fi
+
+      - name: Dry-run notice
+        if: ${{ (inputs.dry_run || false) == true }}
+        run: echo "DRY-RUN — computed the dead set and wrote the report; tore nothing down. Re-dispatch with dry_run=false to reconcile."
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
