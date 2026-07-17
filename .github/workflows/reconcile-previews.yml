@@ -26,10 +26,14 @@
 name: Reconcile Previews
 
 on:
-  schedule:
-    # Daily at 04:17 UTC (low-traffic). Scheduled runs use input defaults
-    # (dry_run=false) and only fire from the default branch.
-    - cron: '17 4 * * *'
+  # DAILY SCHEDULE — DEFERRED. The mechanism is written and one uncomment from
+  # active, but it stays off until the alive-rule is proven BOTH directions
+  # (issue #1011 AC3/AC4/AC5: a qualifying preview survives, a stale one falls).
+  # The maiden run exercises only the dead path via workflow_dispatch; standing
+  # up unattended recurring teardown before the alive path is verified is not
+  # safe. The ac-falsify session uncomments this once AC3/AC4/AC5 pass.
+  # schedule:
+  #   - cron: '17 4 * * *'   # daily 04:17 UTC (low-traffic), default branch only
   workflow_dispatch:
     inputs:
       window_days:
